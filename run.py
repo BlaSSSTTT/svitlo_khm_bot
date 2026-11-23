@@ -138,8 +138,13 @@ def fetch_private(channel):
     return asyncio.run(go())
 
 
+SCHEDULE_LINE = re.compile(r"Підчерга\s+\d\.\d\s*[–—-]\s*\d{1,2}:\d{2}")
+
+
 def is_schedule(text):
-    return "Підчерга" in text and ("відключень" in text or "ГПВ" in text)
+    """Графік — лише якщо є хоча б один рядок «Підчерга 1.1 – 10:00…».
+    Усі інші пости каналу (новини, оголошення) ігноруються."""
+    return bool(SCHEDULE_LINE.search(text or ""))
 
 
 def latest_schedule():
@@ -304,13 +309,14 @@ def check_channel(st):
         return
     mid, text = post
     old = st["sent"].get(str(mid))
-    st["last"] = text
     if old == text:
+        st["last"] = text
         return
     date, sched = parse_post(text)
     if not any(any(h) for h in sched.values()):
         log("Пост", mid, "схожий на графік, але годин не знайдено")
         return
+    st["last"] = text
     since, is_upd = update_info(text)
     edited = old is not None
     updated = edited or is_upd
