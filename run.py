@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Один прохід бота (GitHub Actions запускає його кожні ~10 хвилин):
+"""Бот (GitHub Actions запускає його кожні 10 хв, кожен запуск працює ~9 хв):
   1. обробляє команди, які люди написали боту (/start, /queue, /now, /stop);
   2. дивиться останній графік у каналі;
   3. якщо графік новий або змінений — малює картинку й розсилає підписникам.
@@ -22,6 +22,8 @@ import os
 import re
 import sys
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import requests
 from cryptography.fernet import Fernet, InvalidToken
@@ -35,11 +37,36 @@ STATE_FILE = "state.bin"
 ALLOWED = {int(x) for x in re.findall(r"\d+", os.environ.get("ALLOWED_IDS", ""))}
 VALID = {f"{q}.{s}" for q in range(1, 7) for s in (1, 2)}
 
-HELP = ("Я надсилаю графіки відключень, щойно вони з'являються "
-        "(з затримкою до ~15 хв).\n\n"
+KYIV = ZoneInfo("Europe/Kyiv")
+RUN_SECONDS = int(os.environ.get("RUN_SECONDS", "540"))   # скільки працює один запуск
+CHECK_EVERY = int(os.environ.get("CHECK_EVERY", "60"))    # як часто перевіряти канал, с
+SETUP_VERSION = 2  # збільш, якщо зміниш опис/команди нижче
+
+HELP = ("Я надсилаю графіки відключень, щойно вони з'являються.\n"
+        "Канал перевіряю щохвилини. Зазвичай відповідаю одразу, але іноді — через кілька хвилин.\n\n"
         "/queue 3.1 — вказати свою підчергу (покажу твої години)\n"
         "/now — останній графік\n"
+        "/status — чи працює бот\n"
         "/stop — відписатися")
+
+DESCRIPTION = ("⚡ Надсилаю графіки погодинних відключень світла картинкою, "
+               "щойно вони з'являються в каналі.\n\n"
+               "Канал перевіряю щохвилини. Зазвичай відповідаю одразу, "
+               "але інколи (коли перезапускаюсь) — через кілька хвилин. "
+               "Це нормально, я не завис.\n\n"
+               "Після підписки напиши /queue і свою підчергу (напр. /queue 3.1) — "
+               "буду показувати твої години.")
+
+COMMANDS = [
+    {"command": "now", "description": "Останній графік"},
+    {"command": "queue", "description": "Моя підчерга, напр. /queue 3.1"},
+    {"command": "status", "description": "Чи працює бот"},
+    {"command": "stop", "description": "Відписатися"},
+]
+
+
+def now_kyiv():
+    return datetime.now(KYIV)
 
 
 def log(*a):
@@ -178,8 +205,9 @@ def reply(uid, text):
         log("Не вдалося відповісти", uid, e)
 
 
-def process_updates(st):
-    updates = api("getUpdates", data={"offset": st["offset"], "timeout": 0,
+def process_updates(st, wait=0):
+    # wait > 0 — «довге очікування»: Telegram тримає запит, поки не прийде повідомлення
+    updates = api("getUpdates", data={"offset": st["offset"], "timeout": wait,
                                       "allowed_updates": json.dumps(["message"])})
     for u in updates:
         st["offset"] = u["update_id"] + 1
@@ -216,6 +244,14 @@ def process_updates(st):
                 reply(uid, "Підчергу прибрано. Приклад: /queue 3.1")
             else:
                 reply(uid, "Напиши так: /queue 3.1 (від 1.1 до 6.2)")
+        elif cmd == "/status":
+            lines = ["🟢 Працюю. Перевіряю канал щохвилини.",
+                     f"Зараз: {now_kyiv():%H:%M}"]
+            if st.get("last_date"):
+                lines.append(f"Останній графік: на {st['last_date']} (отримано {st.get('last_got', '?')})")
+            sub = st["subs"].get(key)
+            lines.append(f"Твоя підчерга: {sub}" if sub else "Підчергу не вказано — /queue 3.1")
+            reply(uid, "\n".join(lines))
         elif cmd == "/now":
             if st["last"]:
                 send_schedule(st, uid, st["last"])
@@ -246,15 +282,67 @@ def check_channel(st):
         n += send_schedule(st, int(uid), text, png, edited=old is not None)
         time.sleep(0.1)
     st["sent"][str(mid)] = text
+    st["last_date"] = date
+    st["last_got"] = now_kyiv().strftime("%d.%m %H:%M")
     log(f"Розіслано графік на {date} ({'оновлення' if old else 'новий'}): {n} отримувачів")
+
+
+def setup_profile(st):
+    """Один раз: опис бота (видно до натискання Start) і меню команд."""
+    if st.get("setup") == SETUP_VERSION:
+        return
+    try:
+        api("setMyDescription", data={"description": DESCRIPTION})
+        api("setMyCommands", data={"commands": json.dumps(COMMANDS, ensure_ascii=False)})
+        st["setup"] = SETUP_VERSION
+        log("Опис і команди бота оновлено")
+    except RuntimeError as e:
+        log("Не вдалося оновити опис:", e)
+
+
+_status = {"ok": None, "at": 0}
+
+
+def update_status(ok):
+    """Статус у профілі бота — видно, коли він востаннє перевіряв канал.
+    Оновлюємо раз на 5 хв або коли змінився стан (щоб не впертися в ліміти Telegram)."""
+    if _status["ok"] == ok and time.time() - _status["at"] < 300:
+        return
+    _status.update(ok=ok, at=time.time())
+    t = now_kyiv().strftime("%H:%M")
+    text = (f"🟢 Працює · канал перевіряю щохвилини · остання перевірка о {t}" if ok
+            else f"🟡 Не вдалося прочитати канал о {t} — пробую ще")
+    try:
+        api("setMyShortDescription", data={"short_description": text})
+    except RuntimeError as e:
+        log("Не вдалося оновити статус:", e)
 
 
 def main():
     st = load_state()
     before = json.dumps(st, sort_keys=True, ensure_ascii=False)
+    deadline = time.time() + RUN_SECONDS
+    last_check = 0
     try:
-        process_updates(st)
-        check_channel(st)
+        setup_profile(st)
+        while True:
+            left = deadline - time.time()
+            if left <= 0:
+                break
+            if time.time() - last_check >= CHECK_EVERY:
+                last_check = time.time()
+                ok = False
+                try:
+                    check_channel(st)
+                    ok = True
+                except Exception as e:
+                    log("Помилка при перевірці каналу:", e)
+                update_status(ok)
+            try:
+                process_updates(st, wait=int(max(0, min(25, left, CHECK_EVERY - (time.time() - last_check)))))
+            except Exception as e:
+                log("Помилка при читанні повідомлень:", e)
+                time.sleep(5)
     finally:
         if json.dumps(st, sort_keys=True, ensure_ascii=False) != before:
             save_state(st)
