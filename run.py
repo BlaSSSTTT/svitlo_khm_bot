@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""Один прохід бота (GitHub Actions запускає його кожні ~10 хвилин):
+  1. обробляє команди, які люди написали боту (/start, /queue, /now, /stop);
+  2. дивиться останній графік у каналі;
+  3. якщо графік новий або змінений — малює картинку й розсилає підписникам.
+
+Стан (підписники, що вже розіслано) зберігається зашифрованим у state.bin.
+
+Змінні середовища (GitHub Secrets):
+  BOT_TOKEN    — токен бота від @BotFather (обов'язково)
+  CHANNEL      — канал: назва, @назва або t.me/назва (обов'язково)
+  STATE_KEY    — будь-який довгий пароль для шифрування state.bin (обов'язково)
+  ALLOWED_IDS  — необов'язково: Telegram ID через кому, кому можна підписатися
+  TG_API_ID, TG_API_HASH, TG_SESSION — лише для ПРИВАТНОГО каналу (див. README)
+"""
+import base64
+import hashlib
+import html
+import io
+import json
+import os
+import re
+import sys
+import time
+
+import requests
+from cryptography.fernet import Fernet, InvalidToken
+
+from gpv_image import parse, render
+
+TOKEN = os.environ["BOT_TOKEN"].strip()
+CHANNEL = re.sub(r"^(https?://)?(t\.me/)?(s/)?@?", "", os.environ["CHANNEL"].strip()).strip("/")
+API = f"https://api.telegram.org/bot{TOKEN}/"
+STATE_FILE = "state.bin"
+ALLOWED = {int(x) for x in re.findall(r"\d+", os.environ.get("ALLOWED_IDS", ""))}
+VALID = {f"{q}.{s}" for q in range(1, 7) for s in (1, 2)}
+
+HELP = ("Я надсилаю графіки відключень, щойно вони з'являються "
+        "(з затримкою до ~15 хв).\n\n"
+        "/queue 3.1 — вказати свою підчергу (покажу твої години)\n"
+        "/now — останній графік\n"
+        "/stop — відписатися")
+
+
+def log(*a):
+    print(time.strftime("%H:%M:%S"), *a, flush=True)
+
+
+# ---------- стан ----------
+
+def _fernet():
+    key = hashlib.sha256(os.environ["STATE_KEY"].encode()).digest()
+    return Fernet(base64.urlsafe_b64encode(key))
+
+
+def load_state():
+    st = {"offset": 0, "subs": {}, "sent": {}, "last": None}
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "rb") as f:
+                st.update(json.loads(_fernet().decrypt(f.read())))
+        except InvalidToken:
+            sys.exit("Не вдалося розшифрувати state.bin — STATE_KEY змінився? "
+                     "Поверни старий пароль або видали state.bin з репозиторію.")
+    return st
+
+
+def save_state(st):
+    st["sent"] = dict(sorted(st["sent"].items(), key=lambda kv: int(kv[0]))[-30:])
+    data = _fernet().encrypt(json.dumps(st, ensure_ascii=False).encode())
+    with open(STATE_FILE, "wb") as f:
+        f.write(data)
+
+
+# ---------- канал ----------
+
+def html_to_text(s):
+    s = re.sub(r"<br\s*/?>", "\n", s)
+    s = re.sub(r"<[^>]+>", "", s)
+    return html.unescape(s)
+
+
+def fetch_public(channel):
+    """Публічний канал: читаємо веб-версію t.me/s/<канал> — без входу в акаунт."""
+    r = requests.get(f"https://t.me/s/{channel}", timeout=30,
+                     headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    posts = []
+    for chunk in r.text.split('data-post="')[1:]:
+        m = re.match(r"[^/]+/(\d+)\"", chunk)
+        t = re.search(r'class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', chunk, re.S)
+        if m and t:
+            posts.append((int(m.group(1)), html_to_text(t.group(1))))
+    if not posts and "tgme_channel_info" not in r.text:
+        raise RuntimeError("Не бачу постів. Канал приватний? Тоді потрібні TG_SESSION і т.д. (README)")
+    return posts
+
+
+def fetch_private(channel):
+    """Приватний канал: читаємо від твого акаунта через Telethon."""
+    import asyncio
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+
+    async def go():
+        async with TelegramClient(StringSession(os.environ["TG_SESSION"]),
+                                  int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"]) as c:
+            ent = int(channel) if channel.lstrip("-").isdigit() else channel
+            return [(m.id, m.raw_text or "") async for m in c.iter_messages(ent, limit=20)]
+
+    return asyncio.run(go())
+
+
+def is_schedule(text):
+    return "Підчерга" in text and ("відключень" in text or "ГПВ" in text)
+
+
+def latest_schedule():
+    posts = fetch_private(CHANNEL) if os.environ.get("TG_SESSION") else fetch_public(CHANNEL)
+    sched_posts = [p for p in posts if is_schedule(p[1])]
+    return max(sched_posts) if sched_posts else None
+
+
+# ---------- бот ----------
+
+def api(method, **kw):
+    r = requests.post(API + method, timeout=60, **kw)
+    data = r.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"{method}: {data.get('error_code')} {data.get('description')}")
+    return data["result"]
+
+
+def format_ranges(hours):
+    out, start = [], None
+    for i, h in enumerate(hours):
+        if start is None:
+            start = h
+        if i == len(hours) - 1 or hours[i + 1] != h + 1:
+            out.append(f"{start:02d}:00–{h + 1:02d}:00")
+            start = None
+    return ", ".join(out)
+
+
+def caption(date, sched, queue, edited):
+    c = f"{'🔄 Оновлено графік' if edited else '⚡ Графік відключень'} на {date}"
+    if queue:
+        hours = [h for h, off in enumerate(sched.get(queue, [])) if off]
+        c += f"\nТвоя підчерга {queue}: " + (format_ranges(hours) or "без відключень")
+    return c
+
+
+def send_schedule(st, uid, text, png=None, edited=False):
+    date, sched = parse(text)
+    if png is None:
+        png = make_png(date, sched)
+    try:
+        api("sendPhoto", data={"chat_id": uid, "caption": caption(date, sched, st["subs"].get(str(uid), ""), edited)},
+            files={"photo": (f"gpv_{date}.png", png, "image/png")})
+        return True
+    except RuntimeError as e:
+        log("Не вдалося надіслати", uid, e)
+        if "403" in str(e) or "chat not found" in str(e):
+            st["subs"].pop(str(uid), None)  # заблокував бота
+        return False
+
+
+def make_png(date, sched):
+    buf = io.BytesIO()
+    render(date, sched, buf)
+    return buf.getvalue()
+
+
+def reply(uid, text):
+    try:
+        api("sendMessage", data={"chat_id": uid, "text": text})
+    except RuntimeError as e:
+        log("Не вдалося відповісти", uid, e)
+
+
+def process_updates(st):
+    updates = api("getUpdates", data={"offset": st["offset"], "timeout": 0,
+                                      "allowed_updates": json.dumps(["message"])})
+    for u in updates:
+        st["offset"] = u["update_id"] + 1
+        msg = u.get("message") or {}
+        if msg.get("chat", {}).get("type") != "private":
+            continue
+        uid = msg["chat"]["id"]
+        key = str(uid)
+        text = (msg.get("text") or "").strip()
+        cmd, _, arg = text.partition(" ")
+        cmd = cmd.lower().split("@")[0]
+        arg = arg.strip().rstrip(".")
+        log("Команда від", uid, cmd)
+
+        if cmd == "/start":
+            if ALLOWED and uid not in ALLOWED:
+                reply(uid, "Вибач, цей бот приватний.")
+                continue
+            st["subs"].setdefault(key, "")
+            reply(uid, "✅ Підписано!\n\n" + HELP)
+            if st["last"]:
+                send_schedule(st, uid, st["last"])
+        elif key not in st["subs"]:
+            reply(uid, "Натисни /start, щоб підписатися.")
+        elif cmd == "/stop":
+            st["subs"].pop(key, None)
+            reply(uid, "Відписано. Щоб повернутися — /start")
+        elif cmd == "/queue":
+            if arg in VALID:
+                st["subs"][key] = arg
+                reply(uid, f"Запам'ятав: підчерга {arg}")
+            elif arg in ("", "0", "-"):
+                st["subs"][key] = ""
+                reply(uid, "Підчергу прибрано. Приклад: /queue 3.1")
+            else:
+                reply(uid, "Напиши так: /queue 3.1 (від 1.1 до 6.2)")
+        elif cmd == "/now":
+            if st["last"]:
+                send_schedule(st, uid, st["last"])
+            else:
+                reply(uid, "Графіка поки немає.")
+        else:
+            reply(uid, HELP)
+
+
+def check_channel(st):
+    post = latest_schedule()
+    if not post:
+        log("У каналі не знайдено графіка")
+        return
+    mid, text = post
+    old = st["sent"].get(str(mid))
+    st["last"] = text
+    if old == text:
+        log("Графік", mid, "уже розіслано")
+        return
+    date, sched = parse(text)
+    if not any(any(h) for h in sched.values()):
+        log("Пост", mid, "схожий на графік, але годин не знайдено")
+        return
+    png = make_png(date, sched)
+    n = 0
+    for uid in list(st["subs"]):
+        n += send_schedule(st, int(uid), text, png, edited=old is not None)
+        time.sleep(0.1)
+    st["sent"][str(mid)] = text
+    log(f"Розіслано графік на {date} ({'оновлення' if old else 'новий'}): {n} отримувачів")
+
+
+def main():
+    st = load_state()
+    before = json.dumps(st, sort_keys=True, ensure_ascii=False)
+    try:
+        process_updates(st)
+        check_channel(st)
+    finally:
+        if json.dumps(st, sort_keys=True, ensure_ascii=False) != before:
+            save_state(st)
+            log("Стан збережено")
+
+
+if __name__ == "__main__":
+    main()
