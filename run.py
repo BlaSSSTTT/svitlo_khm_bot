@@ -169,20 +169,56 @@ def format_ranges(hours):
     return ", ".join(out)
 
 
-def caption(date, sched, queue, edited):
-    c = f"{'🔄 Оновлено графік' if edited else '⚡ Графік відключень'} на {date}"
+def parse_post(text):
+    date, sched = parse(text)
+    if not date:  # дати в пості немає — беремо сьогоднішню
+        date = now_kyiv().strftime("%d.%m.%Y")
+    return date, sched
+
+
+def update_info(text):
+    """('', False) для звичайного графіка; ('з 11:00', True) для оновленого."""
+    low = text.lower()
+    if "оновлен" not in low and "змінен" not in low:
+        return "", False
+    m = re.search(r"\bз\s+(\d{1,2}[:.]\d{2})", text)
+    return (f"з {m.group(1).replace('.', ':')}" if m else ""), True
+
+
+def hours_of(sched, queue):
+    return [h for h, off in enumerate(sched.get(queue, [])) if off]
+
+
+def caption(date, sched, queue, updated=False, since="", prev=None):
+    if updated:
+        c = f"🔄 Оновлено графік на {date}" + (f" ({since})" if since else "")
+    else:
+        c = f"⚡ Графік відключень на {date}"
     if queue:
-        hours = [h for h, off in enumerate(sched.get(queue, [])) if off]
-        c += f"\nТвоя підчерга {queue}: " + (format_ranges(hours) or "без відключень")
+        now_h = hours_of(sched, queue)
+        c += f"\nТвоя підчерга {queue}: " + (format_ranges(now_h) or "без відключень")
+        if updated and prev is not None:
+            old_h = hours_of(prev, queue)
+            if old_h == now_h:
+                c += "\n✅ Для твоєї підчерги без змін"
+            else:
+                c += "\n⚠️ Було: " + (format_ranges(old_h) or "без відключень")
+    elif updated and prev is not None:
+        changed = [q for q in sorted(sched) if sched[q] != prev.get(q)]
+        if changed:
+            c += "\nЗмінилося для підчерг: " + ", ".join(changed)
     return c
 
 
-def send_schedule(st, uid, text, png=None, edited=False):
-    date, sched = parse(text)
+def send_schedule(st, uid, text, png=None, edited=False, prev=None):
+    date, sched = parse_post(text)
+    since, is_upd = update_info(text)
+    updated = edited or is_upd
     if png is None:
-        png = make_png(date, sched)
+        png = make_png(date, sched, since if updated else "")
     try:
-        api("sendPhoto", data={"chat_id": uid, "caption": caption(date, sched, st["subs"].get(str(uid), ""), edited)},
+        cap = caption(date, sched, st["subs"].get(str(uid), ""), updated, since, prev)
+        api("sendPhoto", data={"chat_id": uid, "caption": cap},
             files={"photo": (f"gpv_{date}.png", png, "image/png")})
         return True
     except RuntimeError as e:
@@ -192,9 +228,9 @@ def send_schedule(st, uid, text, png=None, edited=False):
         return False
 
 
-def make_png(date, sched):
+def make_png(date, sched, since=""):
     buf = io.BytesIO()
-    render(date, sched, buf)
+    render(date, sched, buf, note=f"оновлено {since}".strip() if since else "")
     return buf.getvalue()
 
 
@@ -270,21 +306,30 @@ def check_channel(st):
     old = st["sent"].get(str(mid))
     st["last"] = text
     if old == text:
-        log("Графік", mid, "уже розіслано")
         return
-    date, sched = parse(text)
+    date, sched = parse_post(text)
     if not any(any(h) for h in sched.values()):
         log("Пост", mid, "схожий на графік, але годин не знайдено")
         return
-    png = make_png(date, sched)
+    since, is_upd = update_info(text)
+    edited = old is not None
+    updated = edited or is_upd
+    # попередній графік на ту саму дату — щоб показати, що змінилося
+    by_date = st.setdefault("by_date", {})
+    prev = by_date.get(date)
+    if not updated:
+        prev = None
+    png = make_png(date, sched, since if updated else "")
     n = 0
     for uid in list(st["subs"]):
-        n += send_schedule(st, int(uid), text, png, edited=old is not None)
+        n += send_schedule(st, int(uid), text, png, edited=edited, prev=prev)
         time.sleep(0.1)
     st["sent"][str(mid)] = text
+    by_date[date] = sched
+    st["by_date"] = dict(list(by_date.items())[-5:])
     st["last_date"] = date
     st["last_got"] = now_kyiv().strftime("%d.%m %H:%M")
-    log(f"Розіслано графік на {date} ({'оновлення' if old else 'новий'}): {n} отримувачів")
+    log(f"Розіслано графік на {date} ({'оновлення ' + since if updated else 'новий'}): {n} отримувачів")
 
 
 def setup_profile(st):
