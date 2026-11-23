@@ -34,9 +34,56 @@ DARK = (60, 60, 60)
 TEXT = (30, 30, 30)
 
 
+MONTHS = {"січ": 1, "лют": 2, "берез": 3, "квіт": 4, "трав": 5, "черв": 6,
+          "лип": 7, "серп": 8, "верес": 9, "жовт": 10, "листоп": 11, "груд": 12}
+
+
+def find_date(text, today=None):
+    """Шукає дату в різних форматах. Повертає 'ДД.ММ.РРРР' або ''."""
+    import datetime as dt
+    if today is None:
+        try:
+            from zoneinfo import ZoneInfo
+            today = dt.datetime.now(ZoneInfo("Europe/Kyiv")).date()
+        except Exception:
+            today = dt.date.today()
+    t = text.replace("\u00a0", " ")
+
+    def ok(d, m, y):
+        y = int(y) if y else today.year
+        if y < 100:
+            y += 2000
+        try:
+            return dt.date(y, int(m), int(d)).strftime("%d.%m.%Y")
+        except ValueError:
+            return ""
+
+    # 23.11.2026 / 23.11.26 / 23/11/2026 / 23-11-2026 / 23.11
+    for m in re.finditer(r"(?<!\d)(\d{1,2})[./-](\d{1,2})(?:[./-](\d{2,4}))?(?!\d)(?!\s*[-–:]\s*\d)", t):
+        if re.search(r"черг\w*[\s\d.,;:і–-]*$", t[max(0, m.start() - 40):m.start()], re.I):
+            continue  # це номер підчерги, а не дата
+        r = ok(*m.groups())
+        if r:
+            return r
+    # 23 листопада (2026)
+    for m in re.finditer(r"(?<!\d)(\d{1,2})\s+([А-Яа-яІіЇїЄєҐґ']+)(?:\s+(\d{4}))?", t):
+        word = m.group(2).lower()
+        for stem, num in MONTHS.items():
+            if word.startswith(stem):
+                r = ok(m.group(1), num, m.group(3))
+                if r:
+                    return r
+    # «завтра» / «сьогодні»
+    low = t.lower()
+    if "завтра" in low:
+        return (today + dt.timedelta(days=1)).strftime("%d.%m.%Y")
+    if "сьогодні" in low:
+        return today.strftime("%d.%m.%Y")
+    return ""
+
+
 def parse(text):
-    m = re.search(r"(\d{2}\.\d{2}\.\d{4})", text)
-    date = m.group(1) if m else ""
+    date = find_date(text)
     sched = {q: [False] * 24 for q in QUEUES}
     for line in text.splitlines():
         m = re.match(r"\s*Підчерга\s+(\d\.\d)\s*[–—-]\s*(.*)", line)
@@ -53,7 +100,7 @@ def parse(text):
     return date, sched
 
 
-def render(date, sched, out):
+def render(date, sched, out, note=""):
     f = lambda p, s: ImageFont.truetype(p, s)
     title_f, hdr_f, cell_f, big_f, num_f, small_f = (
         f(FONT_B, 26), f(FONT_C, 14), f(FONT_B, 15), f(FONT, 22), f(FONT, 17), f(FONT, 15))
@@ -74,6 +121,8 @@ def render(date, sched, out):
     d.text((38 + tw, 30), date, font=title_f, fill=TEXT)
     dw = d.textlength(date, font=title_f)
     d.line((38 + tw, 60, 38 + tw + dw, 60), fill=TEXT, width=2)
+    if note:
+        d.text((38 + tw + dw + 18, 47), note, font=f(FONT_B, 18), fill=(200, 80, 40), anchor="lm")
 
     hx = x0 + qcol + subcol
     ty = y0 + hdr_h
