@@ -2,7 +2,7 @@ name: Графік відключень
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # кожні 10 хв (GitHub може запускати з запізненням)
+    - cron: "*/10 * * * *"   # кожні 10 хв; кожен запуск сам працює ~9 хв
   workflow_dispatch:          # кнопка "Run workflow" для ручного запуску
 
 permissions:
@@ -15,7 +15,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
