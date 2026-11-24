@@ -29,6 +29,7 @@ FONT_C = _pick(_L + "DejaVuSansCondensed.ttf", _D + "DejaVuSansCondensed.ttf", _
 
 QUEUES = [f"{q}.{s}" for q in range(1, 7) for s in (1, 2)]
 BLUE = (142, 169, 219)
+ORANGE = (240, 160, 90)
 GRID = (150, 150, 150)
 DARK = (60, 60, 60)
 TEXT = (30, 30, 30)
@@ -100,7 +101,7 @@ def parse(text):
     return date, sched
 
 
-def render(date, sched, out, note=""):
+def render(date, sched, out, note="", added=None):
     f = lambda p, s: ImageFont.truetype(p, s)
     title_f, hdr_f, cell_f, big_f, num_f, small_f = (
         f(FONT_B, 26), f(FONT_C, 14), f(FONT_B, 15), f(FONT, 22), f(FONT, 17), f(FONT, 15))
@@ -133,7 +134,8 @@ def render(date, sched, out, note=""):
             if sched[q][h]:
                 cx = hx + h * hcol
                 cy = ty + i * row_h
-                d.rectangle((cx, cy, cx + hcol, cy + row_h), fill=BLUE)
+                is_added = bool(added and added.get(q) and added[q][h])
+                d.rectangle((cx, cy, cx + hcol, cy + row_h), fill=ORANGE if is_added else BLUE)
 
     # шапка
     d.multiline_text((x0 + (qcol + subcol) / 2, y0 + hdr_h / 2), "Черга/\nпідчерга",
@@ -174,6 +176,10 @@ def render(date, sched, out, note=""):
     lx = x0 + 340
     d.rectangle((lx, ly, lx + 28, ly + 28), fill=BLUE)
     d.text((lx + 42, ly + 14), "Електроенергія відсутня", font=small_f, fill=TEXT, anchor="lm")
+    if added and any(any(v) for v in added.values()):
+        ox = lx + 300
+        d.rectangle((ox, ly, ox + 28, ly + 28), fill=ORANGE)
+        d.text((ox + 42, ly + 14), "Додаткові відключення", font=small_f, fill=TEXT, anchor="lm")
     d.text((x0 + 10, ly + 65), "Прогноз — оператор системи передачі може змінити обсяг та час обмежень",
            font=f(FONT, 13), fill=(110, 110, 110), anchor="lm")
 
